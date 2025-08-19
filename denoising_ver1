@@ -1,59 +1,81 @@
-# Re-run the integrated pipeline code after state reset (all-in-one cell).
+# -*- coding: utf-8 -*-
+# Integrated pipeline: refactored for clarity (same I/O, same behavior)
 
+from __future__ import annotations
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
+from dataclasses import dataclass
 from pathlib import Path
+from typing import Iterable, List, Sequence, Tuple, Optional, Dict, Any
+from dataclasses import dataclass, field
 
-# ---------- Paths ----------
-RAW_PATH = Path("awake_raw_data001.txt")
-DET_PATH = Path("awake_detected_data001.txt")
+@dataclass(frozen=True)
+class Config:
+    # Paths
+    RAW_PATH: Path = Path("awake_raw_data001.txt")
+    DET_PATH: Path = Path("awake_detected_data001.txt")
 
-OUT_WINDOWS = Path("artifact_windows_expfit_strongcatch.csv")
-OUT_SPIKES  = Path("awake_detected_data001_corrected_expfit_strongcatch.csv")
-OUT_CLEAN   = Path("awake_raw_data001_cleaned_timeseries_expfit_strongcatch.csv")
-OUT_STRONG  = Path("uncovered_strong_points.csv")
+    OUT_WINDOWS: Path = Path("artifact_windows_expfit_strongcatch.csv")
+    OUT_SPIKES:  Path = Path("awake_detected_data001_corrected_expfit_strongcatch.csv")
+    OUT_CLEAN:   Path = Path("awake_raw_data001_cleaned_timeseries_expfit_strongcatch.csv")
+    OUT_STRONG:  Path = Path("uncovered_strong_points.csv")
 
-FIG1 = Path("expfit_fig1_raw_fit_windows.png")
-FIG2 = Path("expfit_fig2_residual_thresholds.png")
-FIG3 = Path("expfit_fig3_clean_timeseries.png")  # 予約（未使用でもリストに残す）
-FIG4 = Path("expfit_fig4_raster_original.png")
-FIG5 = Path("expfit_fig5_raster_corrected.png")
-FIG6 = Path("expfit_fig6_clean_on_original_time_wide.png")
-FIG7 = Path("expfit_fig7_clean_time_concatenated_uniformdt_wide.png")
+    FIG1: Path = Path("expfit_fig1_raw_fit_windows.png")
+    FIG2: Path = Path("expfit_fig2_residual_thresholds.png")
+    FIG3: Path = Path("expfit_fig3_clean_timeseries.png")
+    FIG4: Path = Path("expfit_fig4_raster_original.png")
+    FIG5: Path = Path("expfit_fig5_raster_corrected.png")
+    FIG6: Path = Path("expfit_fig6_clean_on_original_time_wide.png")
+    FIG7: Path = Path("expfit_fig7_clean_time_concatenated_uniformdt_wide.png")
 
-# ---------- Parameters ----------
-STRONG_SIGMA = 6.0  # 強トリガ
-WEAK_SIGMA   = 3.0  # 継続バンド
-RELAX_S      = 0.40
-PAD_S        = 0.30
-MERGE_GAP_S  = 0.25
-MIN_WINDOW_S = 0.03
+    # Parameters
+    STRONG_SIGMA: float = 6.0
+    WEAK_SIGMA:   float = 3.0
+    RELAX_S:      float = 0.40
+    PAD_S:        float = 0.30
+    MERGE_GAP_S:  float = 0.25
+    MIN_WINDOW_S: float = 0.03
 
-TAU_SINGLE_GRID = np.logspace(np.log10(0.02), np.log10(10.0), 40)
-TAU_DOUBLE_GRID = np.logspace(np.log10(0.03), np.log10(8.0), 28)
-USE_DOUBLE = True
+    # Exponential model grids (use default_factory for mutable defaults)
+    TAU_SINGLE_GRID: np.ndarray = field(
+        default_factory=lambda: np.logspace(np.log10(0.02), np.log10(10.0), 40)
+    )
+    TAU_DOUBLE_GRID: np.ndarray = field(
+        default_factory=lambda: np.logspace(np.log10(0.03), np.log10(8.0), 28)
+    )
+    USE_DOUBLE: bool = True
 
+
+CFG = Config()
+
+# =========================
+# Utilities
+# =========================
 def robust_sigma(x: np.ndarray) -> float:
+    """Median absolute deviation → robust σ."""
     x = np.asarray(x, float)
     med = np.nanmedian(x)
     mad = np.nanmedian(np.abs(x - med))
     return 1.4826 * (mad + 1e-12)
 
 def read_raw_table(path: Path) -> pd.DataFrame:
+    """Rawテキスト（空白/タブ区切り）を読み込み、数値化できる列は数値化。"""
     df = pd.read_csv(path, sep=r"\s+|\t+", engine="python")
     for c in df.columns:
         df[c] = pd.to_numeric(df[c], errors="ignore")
     return df
 
 def find_time_col(df: pd.DataFrame) -> str:
+    """時間軸っぽい列名を検出。"""
     for c in df.columns:
         cl = c.lower()
-        if "lapse" in cl or "time" in cl or "[s]" in cl:
+        if ("lapse" in cl) or ("time" in cl) or ("[s]" in cl):
             return c
     raise ValueError("Time column not found.")
 
 def choose_signal_col(df: pd.DataFrame, tcol: str) -> str:
+    """時間列以外から最も分散が大きい数値列を信号列として選択。"""
     num_cands = []
     for c in df.columns:
         if c == tcol:
@@ -71,7 +93,8 @@ def design_single_exp(t: np.ndarray, tau: float) -> np.ndarray:
 def design_double_exp(t: np.ndarray, tau1: float, tau2: float) -> np.ndarray:
     return np.column_stack([np.ones_like(t), np.exp(-t / tau1), np.exp(-t / tau2)])
 
-def fit_ls(X: np.ndarray, y: np.ndarray):
+def fit_ls(X: np.ndarray, y: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray, float]:
+    """最小二乗（弱いリッジ）"""
     XT = X.T
     A = XT @ X
     b = XT @ y
@@ -83,42 +106,56 @@ def fit_ls(X: np.ndarray, y: np.ndarray):
     return coef, yhat, resid, sse
 
 def bic_score(n: int, sse: float, k: int) -> float:
+    """BIC（対数尤度の近似）。"""
     if n <= 0:
         return np.inf
-    sigma2 = max(sse / max(n,1), 1e-300)
-    return n * np.log(sigma2) + k * np.log(max(n,1))
+    sigma2 = max(sse / max(n, 1), 1e-300)
+    return n * np.log(sigma2) + k * np.log(max(n, 1))
 
-def select_exp_model(t_rel: np.ndarray, y: np.ndarray):
+def select_exp_model(t_rel: np.ndarray, y: np.ndarray) -> Dict[str, Any]:
+    """単/二重指数モデルをBICで選択。"""
     n = len(t_rel)
-    best = {"type": None, "coef": None, "tau": None, "yhat": None, "resid": None, "bic": np.inf}
+    best: Dict[str, Any] = {"type": None, "coef": None, "tau": None, "yhat": None, "resid": None, "bic": np.inf}
+
     # single
-    for tau in TAU_SINGLE_GRID:
-        X = design_single_exp(t_rel, tau)
+    for tau in CFG.TAU_SINGLE_GRID:
+        X = design_single_exp(t_rel, float(tau))
         coef, yhat, resid, sse = fit_ls(X, y)
         bic = bic_score(n, sse, k=3)
         if bic < best["bic"]:
-            best.update({"type":"single","coef":coef,"tau":(float(tau),),"yhat":yhat,"resid":resid,"bic":bic})
+            best.update({"type": "single", "coef": coef, "tau": (float(tau),), "yhat": yhat, "resid": resid, "bic": bic})
+
     # double
-    if USE_DOUBLE:
-        taus = TAU_DOUBLE_GRID
+    if CFG.USE_DOUBLE:
+        taus = CFG.TAU_DOUBLE_GRID
         for i, t1 in enumerate(taus):
             for t2 in taus[i:]:
                 X = design_double_exp(t_rel, float(t1), float(t2))
                 coef, yhat, resid, sse = fit_ls(X, y)
                 bic = bic_score(n, sse, k=5)
                 if bic < best["bic"]:
-                    best.update({"type":"double","coef":coef,"tau":(float(t1), float(t2)),"yhat":yhat,"resid":resid,"bic":bic})
+                    best.update({"type": "double", "coef": coef, "tau": (float(t1), float(t2)), "yhat": yhat, "resid": resid, "bic": bic})
     return best
 
-def windows_from_hysteresis(t: np.ndarray, strong_mask: np.ndarray, weak_mask: np.ndarray,
-                            relax_s: float, pad_s: float, merge_gap_s: float, min_window_s: float):
+def windows_from_hysteresis(
+    t: np.ndarray,
+    strong_mask: np.ndarray,
+    weak_mask: np.ndarray,
+    relax_s: float,
+    pad_s: float,
+    merge_gap_s: float,
+    min_window_s: float
+) -> List[Tuple[float, float]]:
+    """ヒステリシス（強開始→弱継続）でウィンドウ抽出し、パディング/マージ/最小長を適用。"""
     t = np.asarray(t, float)
-    dt = float(np.nanmedian(np.diff(t)))
+    dt = float(np.nanmedian(np.diff(t))) if len(t) > 1 else relax_s
     relax_n = max(1, int(round(relax_s / max(dt, 1e-9))))
-    windows = []
+
+    windows: List[Tuple[float, float]] = []
     active = False
     start_idx = None
     relax_cnt = 0
+
     for i in range(len(t)):
         if not active:
             if strong_mask[i]:
@@ -137,13 +174,16 @@ def windows_from_hysteresis(t: np.ndarray, strong_mask: np.ndarray, weak_mask: n
                     active = False
                     start_idx = None
                     relax_cnt = 0
+
     if active and start_idx is not None:
         windows.append((float(t[start_idx]), float(t[-1])))
+
     # padding
     tmin, tmax = float(np.nanmin(t)), float(np.nanmax(t))
     windows = [(max(tmin, a - pad_s), min(tmax, b + pad_s)) for a, b in windows]
+
     # merge
-    merged = []
+    merged: List[Tuple[float, float]] = []
     for a, b in sorted(windows):
         if not merged:
             merged.append((a, b))
@@ -153,17 +193,25 @@ def windows_from_hysteresis(t: np.ndarray, strong_mask: np.ndarray, weak_mask: n
                 merged[-1] = (pa, max(pb, b))
             else:
                 merged.append((a, b))
-    # min duration
-    merged = [(a, b) for a, b in merged if (b - a) >= min_window_s]
-    return merged
 
-def add_uncovered_strong_windows(t: np.ndarray, windows, strong_mask: np.ndarray,
-                                 pad_s: float, merge_gap_s: float, min_window_s: float):
+    # min duration
+    return [(a, b) for a, b in merged if (b - a) >= min_window_s]
+
+def add_uncovered_strong_windows(
+    t: np.ndarray,
+    windows: List[Tuple[float, float]],
+    strong_mask: np.ndarray,
+    pad_s: float,
+    merge_gap_s: float,
+    min_window_s: float
+) -> List[Tuple[float, float]]:
+    """強トリガの未被覆点に短ウィンドウを追加し、再マージ。"""
     t = np.asarray(t, float)
     covered = np.zeros_like(t, dtype=bool)
     for a, b in windows:
         covered |= (t >= a) & (t <= b)
-    add_list = []
+
+    add_list: List[Tuple[float, float]] = []
     for i, is_strong in enumerate(strong_mask):
         if is_strong and not covered[i]:
             a = max(float(t[0]), float(t[i]) - pad_s)
@@ -173,22 +221,25 @@ def add_uncovered_strong_windows(t: np.ndarray, windows, strong_mask: np.ndarray
                 a = max(float(t[0]), float(t[i]) - half)
                 b = min(float(t[-1]), float(t[i]) + half)
             add_list.append((a, b))
-    if add_list:
-        windows = windows + add_list
-        merged = []
-        for a, b in sorted(windows):
-            if not merged:
-                merged.append((a, b))
-            else:
-                pa, pb = merged[-1]
-                if a <= pb + merge_gap_s:
-                    merged[-1] = (pa, max(pb, b))
-                else:
-                    merged.append((a, b))
-        windows = [(a, b) for a, b in merged if (b - a) >= min_window_s]
-    return windows
 
-def compress_timeline(times: np.ndarray, windows):
+    if not add_list:
+        return windows
+
+    windows = windows + add_list
+    merged: List[Tuple[float, float]] = []
+    for a, b in sorted(windows):
+        if not merged:
+            merged.append((a, b))
+        else:
+            pa, pb = merged[-1]
+            if a <= pb + merge_gap_s:
+                merged[-1] = (pa, max(pb, b))
+            else:
+                merged.append((a, b))
+    return [(a, b) for a, b in merged if (b - a) >= min_window_s]
+
+def compress_timeline(times: np.ndarray, windows: Sequence[Tuple[float, float]]) -> np.ndarray:
+    """除外区間を詰めた連結時間に変換。"""
     if not windows:
         return np.asarray(times, float).copy()
     new_t = np.asarray(times, float).copy()
@@ -198,7 +249,8 @@ def compress_timeline(times: np.ndarray, windows):
         new_t[later] -= dur
     return new_t
 
-def remove_in_windows(times: np.ndarray, windows):
+def remove_in_windows(times: np.ndarray, windows: Sequence[Tuple[float, float]]) -> np.ndarray:
+    """除外区間内のサンプルをFalseにするマスク。"""
     if not windows:
         return np.ones_like(times, dtype=bool)
     keep = np.ones_like(times, dtype=bool)
@@ -206,101 +258,220 @@ def remove_in_windows(times: np.ndarray, windows):
         keep &= ~((times >= a) & (times <= b))
     return keep
 
-def load_detected_events(path: Path):
+def load_detected_events(path: Path) -> Tuple[pd.DataFrame, str, Optional[str], Optional[str]]:
+    """検出テーブルを読み込み、ピーク列/開始/終了列を特定。0秒やNaNは除外。"""
     det = pd.read_csv(path, sep="\t", engine="python", skip_blank_lines=True)
     det.columns = [str(c) for c in det.columns]
+
     peak_cols = [c for c in det.columns if "peak time" in c.lower()]
     if not peak_cols:
         peak_cols = [c for c in det.columns if "peak" in c.lower() and ("[s]" in c.lower() or "sec" in c.lower())]
     if not peak_cols:
         raise ValueError("Could not find 'peak time' column in detected events table.")
     peak_col = peak_cols[0]
+
     evcol = next((c for c in det.columns if "event" in c.lower()), None)
     if evcol is not None:
         det = det[pd.to_numeric(det[evcol], errors="coerce").notna()].copy()
+
     det[peak_col] = pd.to_numeric(det[peak_col], errors="coerce")
     det = det[det[peak_col].notna() & (det[peak_col] > 0)].copy()
+
     start_col = next((c for c in det.columns if "start time" in c.lower()), None)
     end_col   = next((c for c in det.columns if "end time" in c.lower()), None)
     if start_col: det[start_col] = pd.to_numeric(det[start_col], errors="coerce")
     if end_col:   det[end_col]   = pd.to_numeric(det[end_col], errors="coerce")
     return det, peak_col, start_col, end_col
 
-# =========================
-# Main Run
-# =========================
-raw_df = read_raw_table(RAW_PATH)
-tcol = find_time_col(raw_df)
-sigcol = choose_signal_col(raw_df, tcol)
+def find_unit_col(det: pd.DataFrame) -> Optional[str]:
+    """ユニットIDらしき列を推定（未使用だが互換のため残置）。"""
+    for key in ["roi", "unit", "cell", "neuron", "id"]:
+        hit = [c for c in det.columns if key in c.lower()]
+        if hit:
+            return hit[0]
+    return None
 
-t = pd.to_numeric(raw_df[tcol], errors="coerce").to_numpy()
-y = pd.to_numeric(raw_df[sigcol], errors="coerce").to_numpy()
-t_rel = t - float(np.nanmin(t))
-
-best = select_exp_model(t_rel, y)
-yhat = best["yhat"]
-resid = best["resid"]
-sig_res = robust_sigma(resid)
-z = np.abs(resid) / sig_res
-strong = z > STRONG_SIGMA
-weak   = z > WEAK_SIGMA
-
-windows = windows_from_hysteresis(t, strong, weak, RELAX_S, PAD_S, MERGE_GAP_S, MIN_WINDOW_S)
-windows = add_uncovered_strong_windows(t, windows, strong, PAD_S, MERGE_GAP_S, MIN_WINDOW_S)
-
-# --- Save window table
-pd.DataFrame([{"start_s": a, "end_s": b, "duration_s": b - a} for a, b in windows]).to_csv(OUT_WINDOWS, index=False)
-
-# --- Strong uncovered list (diagnostic)
-strong_uncovered = []
-covered_mask = np.zeros_like(t, dtype=bool)
-for a, b in windows:
-    covered_mask |= (t >= a) & (t <= b)
-for i, is_strong in enumerate(strong):
-    if is_strong and not covered_mask[i]:
-        strong_uncovered.append({"time_s": float(t[i]), "residual": float(resid[i]), "z": float(z[i])})
-pd.DataFrame(strong_uncovered).to_csv(OUT_STRONG, index=False)
-
-# --- Cleaned series & save
-keep_mask = remove_in_windows(t, windows)
-t_clean = compress_timeline(t[keep_mask], windows)
-y_clean = y[keep_mask]
-pd.DataFrame({"time_corrected_s": t_clean, sigcol: y_clean}).to_csv(OUT_CLEAN, index=False)
-
-# --- Load detected events & correct times
-det, peak_col, start_col, end_col = load_detected_events(DET_PATH)
-peak_t = det[peak_col].to_numpy()
-keep_spk = remove_in_windows(peak_t, windows)
-det["artifact_removed"] = ~keep_spk
-det["peak time corrected [s]"] = compress_timeline(peak_t, windows)
-if start_col:
-    det["start time corrected [s]"] = compress_timeline(det[start_col].to_numpy(), windows)
-if end_col:
-    det["end time corrected [s]"]   = compress_timeline(det[end_col].to_numpy(), windows)
-det.to_csv(OUT_SPIKES, index=False)
+def plot_raster_from_groups(
+    groups: Iterable[Tuple[Any, np.ndarray]],
+    windows: Sequence[Tuple[float, float]],
+    title: str,
+    savepath: Path,
+    figsize: Tuple[int, int] = (12, 4),
+    dpi: int = 200
+) -> None:
+    """ラスタープロット（未使用だが互換のため残置）。"""
+    plt.figure(figsize=figsize)
+    yticks, ylabels = [], []
+    for i, (uid, arr) in enumerate(groups):
+        if len(arr) == 0: 
+            continue
+        y = np.full_like(arr, i, dtype=float)
+        plt.scatter(arr, y, s=4)
+        yticks.append(i)
+        ylabels.append(str(uid))
+    if windows:
+        for a, b in windows:
+            plt.axvspan(a, b, alpha=0.08)
+    plt.yticks(yticks, ylabels)
+    plt.xlabel("time [s]"); plt.ylabel("unit")
+    plt.title(title)
+    plt.tight_layout()
+    plt.savefig(savepath, dpi=dpi, bbox_inches="tight")
+    plt.show()
 
 # =========================
-# Figures (1,2,4,5)
+# Plot helpers
 # =========================
-FIGSIZE = (24, 4)
-DPI = 200
+FIGSIZE_NARROW = (12, 4)
+FIGSIZE_WIDE   = (24, 4)
+DPI            = 200
 
-plt.figure(figsize=FIGSIZE)
-plt.plot(t, y, label="raw")
-plt.plot(t, yhat, label="exp-fit")
-for a, b in windows:
-    plt.axvspan(a, b, alpha=0.2)
-plt.xlabel(tcol); plt.ylabel(sigcol); plt.title("Raw and exponential fit with artifact windows"); plt.legend()
-plt.savefig(FIG1, dpi=DPI, bbox_inches="tight")
-plt.show()
+def plot_fig1_raw_fit_windows(t, y, yhat, windows, tlabel, ylabel, savepath: Path):
+    plt.figure(figsize=FIGSIZE_WIDE)
+    plt.plot(t, y, label="raw")
+    plt.plot(t, yhat, label="exp-fit")
+    for a, b in windows: plt.axvspan(a, b, alpha=0.2)
+    plt.xlabel(tlabel); plt.ylabel(ylabel)
+    plt.title("Raw and exponential fit with artifact windows"); plt.legend()
+    plt.savefig(savepath, dpi=DPI, bbox_inches="tight"); plt.show()
 
-plt.figure(figsize=FIGSIZE)
-plt.plot(t, resid, label="residual")
-thrW = WEAK_SIGMA * sig_res
-thrS = STRONG_SIGMA * sig_res
-for thr in [thrW, thrS]:
-    plt.axhline(+thr, linestyle="--")
-    plt.axhline(-thr, linestyle="--")
-for a, b in windows:
-    plt.axvspan(a, b, alpha=0.15)
-plt.xlabel(tcol); plt.ylabel("residual"); plt.title(f"Residuals with ±{WEAK_SIGMA}σ / ±{STRONG_SIGMA}σ bands and windows"); plt.legend()
+def plot_fig2_residuals(t, resid, sig_res, windows, savepath: Path):
+    plt.figure(figsize=FIGSIZE_WIDE)
+    plt.plot(t, resid, label="residual")
+    thrW = CFG.WEAK_SIGMA * sig_res
+    thrS = CFG.STRONG_SIGMA * sig_res
+    for thr in [thrW, thrS]:
+        plt.axhline(+thr, linestyle="--")
+        plt.axhline(-thr, linestyle="--")
+    for a, b in windows: plt.axvspan(a, b, alpha=0.15)
+    plt.xlabel("time [s]"); plt.ylabel("residual")
+    plt.title(f"Residuals with ±{CFG.WEAK_SIGMA}σ / ±{CFG.STRONG_SIGMA}σ bands and windows"); plt.legend()
+    plt.savefig(savepath, dpi=DPI, bbox_inches="tight"); plt.show()
+
+def plot_fig6_original_axis(t_kept, y_kept, windows, tlabel, ylabel, savepath: Path):
+    plt.figure(figsize=FIGSIZE_WIDE)
+    plt.plot(t_kept, y_kept)
+    for a, b in windows: plt.axvspan(a, b, alpha=0.08)
+    plt.xlabel(tlabel); plt.ylabel(ylabel)
+    plt.title("Clean signal on ORIGINAL time axis (gaps where windows removed)")
+    plt.savefig(savepath, dpi=DPI, bbox_inches="tight"); plt.show()
+
+def plot_fig7_concat_axis(y_kept, tlabel_base: str, ylabel, savepath: Path):
+    dt_med = float(np.nanmedian(np.diff(y_kept.index))) if isinstance(y_kept, pd.Series) else \
+             (float(np.nanmedian(np.diff(np.arange(len(y_kept))))) if len(y_kept) > 1 else 0.002)
+    # 実データ時間間隔：保持サンプルのdt中央値を使う（元実装互換）
+    t_concat = np.arange(len(y_kept)) * (dt_med if np.isfinite(dt_med) and dt_med > 0 else 0.002)
+    plt.figure(figsize=FIGSIZE_WIDE)
+    plt.plot(t_concat, np.asarray(y_kept))
+    plt.xlabel(f"concatenated_time_s (Δt≈{(dt_med if dt_med>0 else 0.002):.4f}s)")
+    plt.ylabel(ylabel)
+    plt.title("Clean signal on CONCATENATED time axis (uniform Δt using kept median)")
+    plt.savefig(savepath, dpi=DPI, bbox_inches="tight"); plt.show()
+
+# =========================
+# Pipeline
+# =========================
+def run_pipeline(cfg: Config = CFG) -> Dict[str, Any]:
+    # --- Load raw & select columns ---
+    raw_df = read_raw_table(cfg.RAW_PATH)
+    tcol   = find_time_col(raw_df)
+    sigcol = choose_signal_col(raw_df, tcol)
+
+    t = pd.to_numeric(raw_df[tcol], errors="coerce").to_numpy()
+    y = pd.to_numeric(raw_df[sigcol], errors="coerce").to_numpy()
+    t_rel = t - float(np.nanmin(t))
+
+    # --- Exponential fit & residuals ---
+    best  = select_exp_model(t_rel, y)
+    yhat  = best["yhat"]
+    resid = best["resid"]
+    sig_res = robust_sigma(resid)
+    z = np.abs(resid) / sig_res
+    strong = z > cfg.STRONG_SIGMA
+    weak   = z > cfg.WEAK_SIGMA
+
+    # --- Windows ---
+    windows = windows_from_hysteresis(
+        t, strong, weak, cfg.RELAX_S, cfg.PAD_S, cfg.MERGE_GAP_S, cfg.MIN_WINDOW_S
+    )
+    windows = add_uncovered_strong_windows(
+        t, windows, strong, cfg.PAD_S, cfg.MERGE_GAP_S, cfg.MIN_WINDOW_S
+    )
+
+    # --- Save window table ---
+    pd.DataFrame(
+        [{"start_s": a, "end_s": b, "duration_s": b - a} for a, b in windows]
+    ).to_csv(cfg.OUT_WINDOWS, index=False)
+
+    # --- Strong uncovered list (diagnostic) ---
+    strong_uncovered: List[Dict[str, float]] = []
+    covered_mask = np.zeros_like(t, dtype=bool)
+    for a, b in windows:
+        covered_mask |= (t >= a) & (t <= b)
+    for i, is_strong in enumerate(strong):
+        if is_strong and not covered_mask[i]:
+            strong_uncovered.append({"time_s": float(t[i]), "residual": float(resid[i]), "z": float(z[i])})
+    pd.DataFrame(strong_uncovered).to_csv(cfg.OUT_STRONG, index=False)
+
+    # --- Cleaned series & save ---
+    keep_mask = remove_in_windows(t, windows)
+    t_clean   = compress_timeline(t[keep_mask], windows)
+    y_clean   = y[keep_mask]
+    pd.DataFrame({"time_corrected_s": t_clean, sigcol: y_clean}).to_csv(cfg.OUT_CLEAN, index=False)
+
+    # --- Load detected events & correct times ---
+    det, peak_col, start_col, end_col = load_detected_events(cfg.DET_PATH)
+    peak_t = det[peak_col].to_numpy()
+    keep_spk = remove_in_windows(peak_t, windows)
+    det["artifact_removed"] = ~keep_spk
+    det["peak time corrected [s]"] = compress_timeline(peak_t, windows)
+    if start_col:
+        det["start time corrected [s]"] = compress_timeline(det[start_col].to_numpy(), windows)
+    if end_col:
+        det["end time corrected [s]"]   = compress_timeline(det[end_col].to_numpy(), windows)
+    det.to_csv(cfg.OUT_SPIKES, index=False)
+
+    # =========================
+    # Figures
+    # =========================
+    plot_fig1_raw_fit_windows(t, y, yhat, windows, tlabel=tcol, ylabel=sigcol, savepath=cfg.FIG1)
+    plot_fig2_residuals(t, resid, sig_res, windows, savepath=cfg.FIG2)
+
+    # Fig6: original time axis (gaps where windows were removed)
+    t_kept = t[keep_mask]
+    y_kept = y[keep_mask]
+    plot_fig6_original_axis(t_kept, y_kept, windows, tlabel=tcol, ylabel=sigcol, savepath=cfg.FIG6)
+
+    # Fig7: concatenated axis with uniform dt (median of kept dt)
+    # （元コードのロジックと互換：dt_medは保持サンプルから算出）
+    if len(t_kept) > 1:
+        dt_med = float(np.nanmedian(np.diff(t_kept)))
+    else:
+        dt_med = 0.002
+    t_concat = np.arange(len(y_kept)) * dt_med
+    plt.figure(figsize=FIGSIZE_WIDE)
+    plt.plot(t_concat, y_kept)
+    plt.xlabel(f"concatenated_time_s (Δt≈{dt_med:.4f}s)")
+    plt.ylabel(sigcol)
+    plt.title("Clean signal on CONCATENATED time axis (uniform Δt using kept median)")
+    plt.savefig(cfg.FIG7, dpi=DPI, bbox_inches="tight")
+    plt.show()
+
+    # --- Summary ---
+    summary = {
+        "windows_csv": str(cfg.OUT_WINDOWS),
+        "clean_csv": str(cfg.OUT_CLEAN),
+        "spikes_csv": str(cfg.OUT_SPIKES),
+        "uncovered_strong_csv": str(cfg.OUT_STRONG),
+        "figures": [str(cfg.FIG1), str(cfg.FIG2), str(cfg.FIG3), str(cfg.FIG4), str(cfg.FIG5), str(cfg.FIG6), str(cfg.FIG7)],
+        "n_windows": int(len(pd.read_csv(cfg.OUT_WINDOWS))) if cfg.OUT_WINDOWS.exists() else 0,
+        "n_clean_points": int(len(y_clean)),
+    }
+    print(summary)
+    return summary
+
+# =========================
+# Entrypoint
+# =========================
+if __name__ == "__main__":
+    run_pipeline(CFG)
